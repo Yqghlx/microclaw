@@ -1632,7 +1632,7 @@ async fn api_audit_logs(
 pub async fn start_web_server(state: Arc<AppState>) {
     let limits = WebLimits::from_config(&state.config);
     let flush_interval = metrics_flush_interval(&state.config);
-    let has_password = call_blocking(state.db.clone(), |db| db.get_auth_password_hash())
+    let mut has_password = call_blocking(state.db.clone(), |db| db.get_auth_password_hash())
         .await
         .ok()
         .flatten()
@@ -1647,8 +1647,18 @@ pub async fn start_web_server(state: Arc<AppState>) {
             "web auth default password enabled: no operator password was configured. Temporary password is '{}'. Please change it in Web UI after sign in.",
             DEFAULT_WEB_PASSWORD
         );
+        has_password = true;
     }
-    let bootstrap_token = None;
+    let bootstrap_token = if has_password {
+        None
+    } else {
+        let token = uuid::Uuid::new_v4().to_string();
+        info!(
+            "web auth bootstrap token generated: use header x-bootstrap-token={} to set operator password",
+            token
+        );
+        Some(token)
+    };
     let web_state = WebState {
         legacy_auth_token: state.config.web_auth_token.clone(),
         bootstrap_token: Arc::new(Mutex::new(bootstrap_token)),
@@ -3360,6 +3370,30 @@ commands:
             .unwrap();
         let second_resp = app.oneshot(second_try).await.unwrap();
         assert_eq!(second_resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_password_bootstrap_token_works_with_legacy_auth_token_present() {
+        let web_state = test_web_state(
+            Box::new(DummyLlm),
+            Some("legacy-token".to_string()),
+            WebLimits::default(),
+        );
+        {
+            let mut guard = web_state.bootstrap_token.lock().await;
+            *guard = Some("bootstrap-legacy-123".to_string());
+        }
+        let app = build_router(web_state.clone());
+
+        let with_token = Request::builder()
+            .method("POST")
+            .uri("/api/auth/password")
+            .header("content-type", "application/json")
+            .header("x-bootstrap-token", "bootstrap-legacy-123")
+            .body(Body::from(r#"{"password":"passw0rd!"}"#))
+            .unwrap();
+        let ok_resp = app.oneshot(with_token).await.unwrap();
+        assert_eq!(ok_resp.status(), StatusCode::OK);
     }
 
     #[test]
