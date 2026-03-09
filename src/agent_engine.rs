@@ -1200,14 +1200,12 @@ pub(crate) async fn process_with_agent_impl(
                         name,
                         input,
                         thought_signature,
-                    } => {
-                        Some(ContentBlock::ToolUse {
-                            id: id.clone(),
-                            name: name.clone(),
-                            input: input.clone(),
-                            thought_signature: thought_signature.clone(),
-                        })
-                    }
+                    } => Some(ContentBlock::ToolUse {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                        thought_signature: thought_signature.clone(),
+                    }),
                     ResponseContentBlock::Other => None,
                 })
                 .collect();
@@ -1990,6 +1988,7 @@ You have access to the following capabilities:
 - Export chat history to markdown (`export_chat`)
 - Understand images sent by users (they appear as image content blocks)
 - Spawn and manage asynchronous sub-agent runs (`sessions_spawn`, `subagents_list`, `subagents_info`, `subagents_kill`)
+- Run depth-2 orchestration template with structured merge (`subagents_orchestrate`)
 - Activate agent skills (`activate_skill`) for specialized tasks
 - Install skills from repos (`sync_skills`, `clawhub_install`, `clawhub_search`) — use these instead of manually writing SKILL.md files. Skills go in ~/.microclaw/skills/ (or configured skills dir).
 - Plan and track tasks with a todo list (`todo_read`, `todo_write`) — use this to break down complex tasks into steps, track progress, and stay organized

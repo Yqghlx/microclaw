@@ -60,6 +60,7 @@ impl ToolRegistry {
                 | "subagents_unfocus"
                 | "subagents_focused"
                 | "subagents_send"
+                | "subagents_orchestrate"
         )
     }
 
@@ -223,6 +224,11 @@ impl ToolRegistry {
                 db.clone(),
                 channel_registry.clone(),
             )),
+            Box::new(subagents::SubagentsOrchestrateTool::new(
+                config,
+                db.clone(),
+                channel_registry.clone(),
+            )),
             Box::new(subagents::SubagentsLogTool::new(db.clone())),
             Box::new(subagents::SubagentsRetryAnnouncesTool::new(
                 config,
@@ -351,13 +357,18 @@ impl ToolRegistry {
                 tools.push(Box::new(subagents::SessionsSpawnTool::new(
                     config,
                     db.clone(),
-                    channel_registry,
+                    channel_registry.clone(),
                 )));
                 tools.push(Box::new(subagents::SubagentsListTool::new(db.clone())));
                 tools.push(Box::new(subagents::SubagentsInfoTool::new(db.clone())));
                 tools.push(Box::new(subagents::SubagentsKillTool::new(
                     config,
                     db.clone(),
+                )));
+                tools.push(Box::new(subagents::SubagentsOrchestrateTool::new(
+                    config,
+                    db.clone(),
+                    channel_registry.clone(),
                 )));
                 tools.push(Box::new(subagents::SubagentsLogTool::new(db.clone())));
             }

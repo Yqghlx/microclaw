@@ -1678,6 +1678,10 @@ fn build_router(web_state: WebState) -> Router {
         .route("/api/metrics", get(metrics::api_metrics))
         .route("/api/metrics/summary", get(metrics::api_metrics_summary))
         .route("/api/metrics/history", get(metrics::api_metrics_history))
+        .route(
+            "/api/subagents/observability",
+            get(metrics::api_subagents_observability),
+        )
         .route("/api/send", post(api_send))
         .route("/api/send_stream", post(stream::api_send_stream))
         .route("/api/stream", get(stream::api_stream))

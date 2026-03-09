@@ -183,7 +183,7 @@ pub struct AuditLogRecord {
 pub type SessionMetaRow = (String, String, Option<String>, Option<i64>);
 pub type SessionTreeRow = (i64, Option<String>, Option<i64>, String);
 
-const SCHEMA_VERSION_CURRENT: i64 = 17;
+const SCHEMA_VERSION_CURRENT: i64 = 18;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -235,6 +235,8 @@ pub struct SubagentRunRecord {
     pub total_tokens: i64,
     pub provider: String,
     pub model: String,
+    pub token_budget: i64,
+    pub artifact_json: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -248,6 +250,21 @@ pub struct SubagentAnnounceRecord {
     pub attempts: i64,
     pub next_attempt_at: Option<String>,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubagentObservabilitySnapshot {
+    pub active_runs: i64,
+    pub queued_runs: i64,
+    pub running_runs: i64,
+    pub pending_announces: i64,
+    pub retry_announces: i64,
+    pub failed_announces: i64,
+    pub completed_24h: i64,
+    pub failed_24h: i64,
+    pub budget_exceeded_24h: i64,
+    pub avg_duration_ms_24h: i64,
+    pub recent_runs: Vec<SubagentRunRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -771,6 +788,22 @@ fn apply_schema_migrations(conn: &Connection) -> Result<(), MicroClawError> {
         )?;
         set_schema_version(conn, 17)?;
         version = 17;
+    }
+    if version < 18 {
+        if !table_has_column(conn, "subagent_runs", "token_budget")? {
+            conn.execute(
+                "ALTER TABLE subagent_runs ADD COLUMN token_budget INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !table_has_column(conn, "subagent_runs", "artifact_json")? {
+            conn.execute(
+                "ALTER TABLE subagent_runs ADD COLUMN artifact_json TEXT",
+                [],
+            )?;
+        }
+        set_schema_version(conn, 18)?;
+        version = 18;
     }
     if version != SCHEMA_VERSION_CURRENT {
         set_schema_version(conn, SCHEMA_VERSION_CURRENT)?;
@@ -3634,6 +3667,7 @@ impl Database {
         run_id: &str,
         parent_run_id: Option<&str>,
         depth: i64,
+        token_budget: i64,
         chat_id: i64,
         caller_channel: &str,
         task: &str,
@@ -3645,12 +3679,13 @@ impl Database {
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO subagent_runs(
-                run_id, parent_run_id, depth, chat_id, caller_channel, task, context, status, created_at, provider, model
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'accepted', ?8, ?9, ?10)",
+                run_id, parent_run_id, depth, token_budget, chat_id, caller_channel, task, context, status, created_at, provider, model
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'accepted', ?9, ?10, ?11)",
             params![
                 run_id,
                 parent_run_id,
                 depth,
+                token_budget,
                 chat_id,
                 caller_channel,
                 task,
@@ -3692,6 +3727,7 @@ impl Database {
         status: &str,
         error_text: Option<&str>,
         result_text: Option<&str>,
+        artifact_json: Option<&str>,
         input_tokens: i64,
         output_tokens: i64,
     ) -> Result<(), MicroClawError> {
@@ -3703,9 +3739,10 @@ impl Database {
                  finished_at = ?3,
                  error_text = ?4,
                  result_text = ?5,
-                 input_tokens = ?6,
-                 output_tokens = ?7,
-                 total_tokens = (?6 + ?7)
+                 artifact_json = ?6,
+                 input_tokens = ?7,
+                 output_tokens = ?8,
+                 total_tokens = (?7 + ?8)
              WHERE run_id = ?1",
             params![
                 run_id,
@@ -3713,6 +3750,7 @@ impl Database {
                 now,
                 error_text,
                 result_text,
+                artifact_json,
                 input_tokens,
                 output_tokens
             ],
@@ -3743,9 +3781,9 @@ impl Database {
     ) -> Result<Vec<SubagentRunRecord>, MicroClawError> {
         let conn = self.lock_conn();
         let mut stmt = conn.prepare(
-            "SELECT run_id, parent_run_id, depth, chat_id, caller_channel, task, context, status, created_at,
+            "SELECT run_id, parent_run_id, depth, token_budget, chat_id, caller_channel, task, context, status, created_at,
                     started_at, finished_at, cancel_requested, error_text, result_text,
-                    input_tokens, output_tokens, total_tokens, provider, model
+                    input_tokens, output_tokens, total_tokens, provider, model, artifact_json
              FROM subagent_runs
              WHERE chat_id = ?1
              ORDER BY created_at DESC
@@ -3756,22 +3794,24 @@ impl Database {
                 run_id: row.get(0)?,
                 parent_run_id: row.get(1)?,
                 depth: row.get(2)?,
-                chat_id: row.get(3)?,
-                caller_channel: row.get(4)?,
-                task: row.get(5)?,
-                context: row.get(6)?,
-                status: row.get(7)?,
-                created_at: row.get(8)?,
-                started_at: row.get(9)?,
-                finished_at: row.get(10)?,
-                cancel_requested: row.get::<_, i64>(11)? != 0,
-                error_text: row.get(12)?,
-                result_text: row.get(13)?,
-                input_tokens: row.get(14)?,
-                output_tokens: row.get(15)?,
-                total_tokens: row.get(16)?,
-                provider: row.get(17)?,
-                model: row.get(18)?,
+                token_budget: row.get(3)?,
+                chat_id: row.get(4)?,
+                caller_channel: row.get(5)?,
+                task: row.get(6)?,
+                context: row.get(7)?,
+                status: row.get(8)?,
+                created_at: row.get(9)?,
+                started_at: row.get(10)?,
+                finished_at: row.get(11)?,
+                cancel_requested: row.get::<_, i64>(12)? != 0,
+                error_text: row.get(13)?,
+                result_text: row.get(14)?,
+                input_tokens: row.get(15)?,
+                output_tokens: row.get(16)?,
+                total_tokens: row.get(17)?,
+                provider: row.get(18)?,
+                model: row.get(19)?,
+                artifact_json: row.get(20)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -3784,9 +3824,9 @@ impl Database {
     ) -> Result<Option<SubagentRunRecord>, MicroClawError> {
         let conn = self.lock_conn();
         conn.query_row(
-            "SELECT run_id, parent_run_id, depth, chat_id, caller_channel, task, context, status, created_at,
+            "SELECT run_id, parent_run_id, depth, token_budget, chat_id, caller_channel, task, context, status, created_at,
                     started_at, finished_at, cancel_requested, error_text, result_text,
-                    input_tokens, output_tokens, total_tokens, provider, model
+                    input_tokens, output_tokens, total_tokens, provider, model, artifact_json
              FROM subagent_runs
              WHERE run_id = ?1 AND chat_id = ?2",
             params![run_id, chat_id],
@@ -3795,22 +3835,24 @@ impl Database {
                     run_id: row.get(0)?,
                     parent_run_id: row.get(1)?,
                     depth: row.get(2)?,
-                    chat_id: row.get(3)?,
-                    caller_channel: row.get(4)?,
-                    task: row.get(5)?,
-                    context: row.get(6)?,
-                    status: row.get(7)?,
-                    created_at: row.get(8)?,
-                    started_at: row.get(9)?,
-                    finished_at: row.get(10)?,
-                    cancel_requested: row.get::<_, i64>(11)? != 0,
-                    error_text: row.get(12)?,
-                    result_text: row.get(13)?,
-                    input_tokens: row.get(14)?,
-                    output_tokens: row.get(15)?,
-                    total_tokens: row.get(16)?,
-                    provider: row.get(17)?,
-                    model: row.get(18)?,
+                    token_budget: row.get(3)?,
+                    chat_id: row.get(4)?,
+                    caller_channel: row.get(5)?,
+                    task: row.get(6)?,
+                    context: row.get(7)?,
+                    status: row.get(8)?,
+                    created_at: row.get(9)?,
+                    started_at: row.get(10)?,
+                    finished_at: row.get(11)?,
+                    cancel_requested: row.get::<_, i64>(12)? != 0,
+                    error_text: row.get(13)?,
+                    result_text: row.get(14)?,
+                    input_tokens: row.get(15)?,
+                    output_tokens: row.get(16)?,
+                    total_tokens: row.get(17)?,
+                    provider: row.get(18)?,
+                    model: row.get(19)?,
+                    artifact_json: row.get(20)?,
                 })
             },
         )
@@ -4014,6 +4056,258 @@ impl Database {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    pub fn get_subagent_observability_snapshot(
+        &self,
+        chat_id: Option<i64>,
+        recent_limit: usize,
+    ) -> Result<SubagentObservabilitySnapshot, MicroClawError> {
+        let conn = self.lock_conn();
+        let since = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+        let active_filter = if chat_id.is_some() {
+            " AND chat_id = ?1"
+        } else {
+            ""
+        };
+
+        let active_runs: i64 = if let Some(cid) = chat_id {
+            conn.query_row(
+                "SELECT COUNT(*) FROM subagent_runs
+                 WHERE status IN ('accepted','queued','running') AND chat_id = ?1",
+                params![cid],
+                |row| row.get(0),
+            )?
+        } else {
+            conn.query_row(
+                "SELECT COUNT(*) FROM subagent_runs
+                 WHERE status IN ('accepted','queued','running')",
+                [],
+                |row| row.get(0),
+            )?
+        };
+        let queued_runs: i64 = if let Some(cid) = chat_id {
+            conn.query_row(
+                "SELECT COUNT(*) FROM subagent_runs WHERE status = 'queued' AND chat_id = ?1",
+                params![cid],
+                |row| row.get(0),
+            )?
+        } else {
+            conn.query_row(
+                "SELECT COUNT(*) FROM subagent_runs WHERE status = 'queued'",
+                [],
+                |row| row.get(0),
+            )?
+        };
+        let running_runs: i64 = if let Some(cid) = chat_id {
+            conn.query_row(
+                "SELECT COUNT(*) FROM subagent_runs WHERE status = 'running' AND chat_id = ?1",
+                params![cid],
+                |row| row.get(0),
+            )?
+        } else {
+            conn.query_row(
+                "SELECT COUNT(*) FROM subagent_runs WHERE status = 'running'",
+                [],
+                |row| row.get(0),
+            )?
+        };
+
+        let pending_announces: i64 = if let Some(cid) = chat_id {
+            conn.query_row(
+                "SELECT COUNT(*) FROM subagent_announces WHERE status = 'pending' AND chat_id = ?1",
+                params![cid],
+                |row| row.get(0),
+            )?
+        } else {
+            conn.query_row(
+                "SELECT COUNT(*) FROM subagent_announces WHERE status = 'pending'",
+                [],
+                |row| row.get(0),
+            )?
+        };
+        let retry_announces: i64 = if let Some(cid) = chat_id {
+            conn.query_row(
+                "SELECT COUNT(*) FROM subagent_announces WHERE status = 'retry' AND chat_id = ?1",
+                params![cid],
+                |row| row.get(0),
+            )?
+        } else {
+            conn.query_row(
+                "SELECT COUNT(*) FROM subagent_announces WHERE status = 'retry'",
+                [],
+                |row| row.get(0),
+            )?
+        };
+        let failed_announces: i64 = if let Some(cid) = chat_id {
+            conn.query_row(
+                "SELECT COUNT(*) FROM subagent_announces WHERE status = 'failed' AND chat_id = ?1",
+                params![cid],
+                |row| row.get(0),
+            )?
+        } else {
+            conn.query_row(
+                "SELECT COUNT(*) FROM subagent_announces WHERE status = 'failed'",
+                [],
+                |row| row.get(0),
+            )?
+        };
+
+        let completed_24h: i64 = if let Some(cid) = chat_id {
+            conn.query_row(
+                "SELECT COUNT(*) FROM subagent_runs
+                 WHERE status = 'completed' AND finished_at IS NOT NULL
+                   AND unixepoch(finished_at) >= unixepoch(?1)
+                   AND chat_id = ?2",
+                params![since, cid],
+                |row| row.get(0),
+            )?
+        } else {
+            conn.query_row(
+                "SELECT COUNT(*) FROM subagent_runs
+                 WHERE status = 'completed' AND finished_at IS NOT NULL
+                   AND unixepoch(finished_at) >= unixepoch(?1)",
+                params![since],
+                |row| row.get(0),
+            )?
+        };
+        let failed_24h: i64 = if let Some(cid) = chat_id {
+            conn.query_row(
+                "SELECT COUNT(*) FROM subagent_runs
+                 WHERE status IN ('failed','timed_out','cancelled') AND finished_at IS NOT NULL
+                   AND unixepoch(finished_at) >= unixepoch(?1)
+                   AND chat_id = ?2",
+                params![since, cid],
+                |row| row.get(0),
+            )?
+        } else {
+            conn.query_row(
+                "SELECT COUNT(*) FROM subagent_runs
+                 WHERE status IN ('failed','timed_out','cancelled') AND finished_at IS NOT NULL
+                   AND unixepoch(finished_at) >= unixepoch(?1)",
+                params![since],
+                |row| row.get(0),
+            )?
+        };
+        let budget_exceeded_24h: i64 = if let Some(cid) = chat_id {
+            conn.query_row(
+                "SELECT COUNT(*) FROM subagent_runs
+                 WHERE status = 'budget_exceeded' AND finished_at IS NOT NULL
+                   AND unixepoch(finished_at) >= unixepoch(?1)
+                   AND chat_id = ?2",
+                params![since, cid],
+                |row| row.get(0),
+            )?
+        } else {
+            conn.query_row(
+                "SELECT COUNT(*) FROM subagent_runs
+                 WHERE status = 'budget_exceeded' AND finished_at IS NOT NULL
+                   AND unixepoch(finished_at) >= unixepoch(?1)",
+                params![since],
+                |row| row.get(0),
+            )?
+        };
+
+        let avg_duration_ms_24h: i64 = if let Some(cid) = chat_id {
+            conn.query_row(
+                "SELECT COALESCE(AVG((julianday(finished_at) - julianday(started_at)) * 86400000.0), 0)
+                 FROM subagent_runs
+                 WHERE started_at IS NOT NULL AND finished_at IS NOT NULL
+                   AND unixepoch(finished_at) >= unixepoch(?1)
+                   AND chat_id = ?2",
+                params![since, cid],
+                |row| row.get::<_, f64>(0).map(|v| v as i64),
+            )?
+        } else {
+            conn.query_row(
+                "SELECT COALESCE(AVG((julianday(finished_at) - julianday(started_at)) * 86400000.0), 0)
+                 FROM subagent_runs
+                 WHERE started_at IS NOT NULL AND finished_at IS NOT NULL
+                   AND unixepoch(finished_at) >= unixepoch(?1)",
+                params![since],
+                |row| row.get::<_, f64>(0).map(|v| v as i64),
+            )?
+        };
+
+        let mut stmt = conn.prepare(&format!(
+            "SELECT run_id, parent_run_id, depth, token_budget, chat_id, caller_channel, task, context, status, created_at,
+                    started_at, finished_at, cancel_requested, error_text, result_text,
+                    input_tokens, output_tokens, total_tokens, provider, model, artifact_json
+             FROM subagent_runs
+             WHERE 1=1 {active_filter}
+             ORDER BY created_at DESC
+             LIMIT ?{}",
+            if chat_id.is_some() { 2 } else { 1 }
+        ))?;
+        let recent_runs = if let Some(cid) = chat_id {
+            let rows = stmt.query_map(params![cid, recent_limit.max(1) as i64], |row| {
+                Ok(SubagentRunRecord {
+                    run_id: row.get(0)?,
+                    parent_run_id: row.get(1)?,
+                    depth: row.get(2)?,
+                    token_budget: row.get(3)?,
+                    chat_id: row.get(4)?,
+                    caller_channel: row.get(5)?,
+                    task: row.get(6)?,
+                    context: row.get(7)?,
+                    status: row.get(8)?,
+                    created_at: row.get(9)?,
+                    started_at: row.get(10)?,
+                    finished_at: row.get(11)?,
+                    cancel_requested: row.get::<_, i64>(12)? != 0,
+                    error_text: row.get(13)?,
+                    result_text: row.get(14)?,
+                    input_tokens: row.get(15)?,
+                    output_tokens: row.get(16)?,
+                    total_tokens: row.get(17)?,
+                    provider: row.get(18)?,
+                    model: row.get(19)?,
+                    artifact_json: row.get(20)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        } else {
+            let rows = stmt.query_map(params![recent_limit.max(1) as i64], |row| {
+                Ok(SubagentRunRecord {
+                    run_id: row.get(0)?,
+                    parent_run_id: row.get(1)?,
+                    depth: row.get(2)?,
+                    token_budget: row.get(3)?,
+                    chat_id: row.get(4)?,
+                    caller_channel: row.get(5)?,
+                    task: row.get(6)?,
+                    context: row.get(7)?,
+                    status: row.get(8)?,
+                    created_at: row.get(9)?,
+                    started_at: row.get(10)?,
+                    finished_at: row.get(11)?,
+                    cancel_requested: row.get::<_, i64>(12)? != 0,
+                    error_text: row.get(13)?,
+                    result_text: row.get(14)?,
+                    input_tokens: row.get(15)?,
+                    output_tokens: row.get(16)?,
+                    total_tokens: row.get(17)?,
+                    provider: row.get(18)?,
+                    model: row.get(19)?,
+                    artifact_json: row.get(20)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        Ok(SubagentObservabilitySnapshot {
+            active_runs,
+            queued_runs,
+            running_runs,
+            pending_announces,
+            retry_announces,
+            failed_announces,
+            completed_24h,
+            failed_24h,
+            budget_exceeded_24h,
+            avg_duration_ms_24h,
+            recent_runs,
+        })
     }
 }
 

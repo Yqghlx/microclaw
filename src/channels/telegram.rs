@@ -18,6 +18,7 @@ use crate::channels::startup_guard::{
 use crate::chat_commands::maybe_handle_plugin_command;
 use crate::chat_commands::{handle_chat_command, is_slash_command, unknown_command_response};
 use crate::runtime::AppState;
+use crate::tools::ToolAuthContext;
 use microclaw_channels::channel::ConversationKind;
 use microclaw_channels::channel_adapter::ChannelAdapter;
 #[cfg(test)]
@@ -182,6 +183,34 @@ impl TelegramAdapter {
     }
 }
 
+fn telegram_external_chat_id(chat_id: i64, thread_id: Option<ThreadId>) -> String {
+    match thread_id {
+        Some(tid) => format!("{chat_id}#t:{}", tid.0 .0),
+        None => chat_id.to_string(),
+    }
+}
+
+fn parse_telegram_external_chat_id(
+    external_chat_id: &str,
+) -> Result<(i64, Option<ThreadId>), String> {
+    let normalized = external_chat_id.trim();
+    if let Some((chat, thread)) = normalized.split_once("#t:") {
+        let chat_id = chat
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| format!("Invalid Telegram external_chat_id '{}'", external_chat_id))?;
+        let thread_id = thread
+            .trim()
+            .parse::<i32>()
+            .map_err(|_| format!("Invalid Telegram thread id in '{}'", external_chat_id))?;
+        return Ok((chat_id, Some(ThreadId(MessageId(thread_id)))));
+    }
+    let chat_id = normalized
+        .parse::<i64>()
+        .map_err(|_| format!("Invalid Telegram external_chat_id '{}'", external_chat_id))?;
+    Ok((chat_id, None))
+}
+
 #[async_trait]
 impl ChannelAdapter for TelegramAdapter {
     fn name(&self) -> &str {
@@ -202,10 +231,8 @@ impl ChannelAdapter for TelegramAdapter {
     }
 
     async fn send_text(&self, external_chat_id: &str, text: &str) -> Result<(), String> {
-        let telegram_chat_id = external_chat_id
-            .parse::<i64>()
-            .map_err(|_| format!("Invalid Telegram external_chat_id '{}'", external_chat_id))?;
-        send_response(&self.bot, ChatId(telegram_chat_id), text, None).await;
+        let (telegram_chat_id, thread_id) = parse_telegram_external_chat_id(external_chat_id)?;
+        send_response(&self.bot, ChatId(telegram_chat_id), text, thread_id).await;
         Ok(())
     }
 
@@ -215,9 +242,7 @@ impl ChannelAdapter for TelegramAdapter {
         file_path: &Path,
         caption: Option<&str>,
     ) -> Result<String, String> {
-        let telegram_chat_id = external_chat_id
-            .parse::<i64>()
-            .map_err(|_| format!("Invalid Telegram external_chat_id '{}'", external_chat_id))?;
+        let (telegram_chat_id, thread_id) = parse_telegram_external_chat_id(external_chat_id)?;
 
         let (caption_for_attachment, overflow_text) = Self::split_telegram_caption(caption);
 
@@ -228,6 +253,9 @@ impl ChannelAdapter for TelegramAdapter {
             if let Some(c) = &caption_for_attachment {
                 req = req.caption(c.clone());
             }
+            if let Some(tid) = thread_id.clone() {
+                req = req.message_thread_id(tid);
+            }
             req.await
                 .map_err(|e| format!("Failed to send Telegram photo: {e}"))?;
         } else {
@@ -237,12 +265,15 @@ impl ChannelAdapter for TelegramAdapter {
             if let Some(c) = &caption_for_attachment {
                 req = req.caption(c.clone());
             }
+            if let Some(tid) = thread_id.clone() {
+                req = req.message_thread_id(tid);
+            }
             req.await
                 .map_err(|e| format!("Failed to send Telegram attachment: {e}"))?;
         }
 
         if let Some(extra) = overflow_text {
-            send_response(&self.bot, ChatId(telegram_chat_id), &extra, None).await;
+            send_response(&self.bot, ChatId(telegram_chat_id), &extra, thread_id).await;
         }
 
         Ok(match caption {
@@ -597,7 +628,7 @@ async fn handle_message(
             return Ok(());
         }
         let sender_id_text = sender_user_id.map(|v| v.to_string());
-        let external_chat_id = raw_chat_id.to_string();
+        let external_chat_id = telegram_external_chat_id(raw_chat_id, msg.thread_id);
         let chat_title_for_lookup = chat_title.clone();
         let chat_type_for_lookup = db_chat_type.to_string();
         let channel_name = tg_channel_name.clone();
@@ -820,7 +851,7 @@ async fn handle_message(
         && !tg_allowed_groups.is_empty()
         && !tg_allowed_groups.contains(&raw_chat_id)
     {
-        let external_chat_id = raw_chat_id.to_string();
+        let external_chat_id = telegram_external_chat_id(raw_chat_id, msg.thread_id);
         let chat_title_for_lookup = chat_title.clone();
         let chat_type_for_lookup = db_chat_type.to_string();
         let channel_name = tg_channel_name.clone();
@@ -871,7 +902,7 @@ async fn handle_message(
         return Ok(());
     }
 
-    let external_chat_id = raw_chat_id.to_string();
+    let external_chat_id = telegram_external_chat_id(raw_chat_id, msg.thread_id);
     let chat_title_for_lookup = chat_title.clone();
     let chat_type_for_lookup = db_chat_type.to_string();
     let channel_name = tg_channel_name.clone();
@@ -916,7 +947,7 @@ async fn handle_message(
         id: inbound_message_id.clone(),
         chat_id,
         sender_name: sender_name.clone(),
-        content: stored_content,
+        content: stored_content.clone(),
         is_from_bot: false,
         timestamp: chrono::Utc::now().to_rfc3339(),
     };
@@ -944,6 +975,64 @@ async fn handle_message(
             tg_bot_user_id
         );
         return Ok(());
+    }
+
+    if state.config.subagents.thread_bound_routing_enabled {
+        let focused =
+            match call_blocking(state.db.clone(), move |db| db.get_subagent_focus(chat_id)).await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        "Telegram focused-run lookup failed for chat {}: {}",
+                        chat_id, e
+                    );
+                    None
+                }
+            };
+        if focused.is_some() {
+            let auth = ToolAuthContext {
+                caller_channel: tg_channel_name.clone(),
+                caller_chat_id: chat_id,
+                control_chat_ids: state.config.control_chat_ids.clone(),
+                env_files: Vec::new(),
+            };
+            let routed = state
+                .tools
+                .execute_with_auth(
+                    "subagents_send",
+                    serde_json::json!({
+                        "message": stored_content,
+                        "chat_id": chat_id
+                    }),
+                    &auth,
+                )
+                .await;
+            if !routed.is_error {
+                let route_ack = serde_json::from_str::<serde_json::Value>(&routed.content)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("run_id")
+                            .and_then(|id| id.as_str())
+                            .map(|id| format!("Routed to focused subagent run `{id}`."))
+                    })
+                    .unwrap_or_else(|| "Routed to focused subagent continuation run.".to_string());
+                send_response(&bot, msg.chat.id, &route_ack, msg.thread_id).await;
+                let bot_msg = StoredMessage {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    chat_id,
+                    sender_name: tg_bot_username.clone(),
+                    content: route_ack,
+                    is_from_bot: true,
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                };
+                let _ = call_blocking(state.db.clone(), move |db| db.store_message(&bot_msg)).await;
+                return Ok(());
+            }
+            warn!(
+                "Telegram focused subagent routing failed for chat {}: {}",
+                chat_id, routed.content
+            );
+        }
     }
 
     info!(

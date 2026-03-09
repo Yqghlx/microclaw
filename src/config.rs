@@ -162,6 +162,12 @@ fn default_subagent_thread_bound_routing_enabled() -> bool {
 fn default_subagent_announce_relay_interval_secs() -> u64 {
     15
 }
+fn default_subagent_max_tokens_per_run() -> i64 {
+    120_000
+}
+fn default_subagent_orchestrate_max_workers() -> usize {
+    5
+}
 
 fn default_model_prices() -> Vec<ModelPrice> {
     Vec::new()
@@ -263,6 +269,10 @@ pub struct SubagentConfig {
     pub thread_bound_routing_enabled: bool,
     #[serde(default = "default_subagent_announce_relay_interval_secs")]
     pub announce_relay_interval_secs: u64,
+    #[serde(default = "default_subagent_max_tokens_per_run")]
+    pub max_tokens_per_run: i64,
+    #[serde(default = "default_subagent_orchestrate_max_workers")]
+    pub orchestrate_max_workers: usize,
 }
 
 impl Default for SubagentConfig {
@@ -276,6 +286,8 @@ impl Default for SubagentConfig {
             max_children_per_run: default_subagent_max_children_per_run(),
             thread_bound_routing_enabled: default_subagent_thread_bound_routing_enabled(),
             announce_relay_interval_secs: default_subagent_announce_relay_interval_secs(),
+            max_tokens_per_run: default_subagent_max_tokens_per_run(),
+            orchestrate_max_workers: default_subagent_orchestrate_max_workers(),
         }
     }
 }
@@ -1073,6 +1085,16 @@ Use operator password + API keys for Web auth."
         }
         self.subagents.announce_relay_interval_secs =
             self.subagents.announce_relay_interval_secs.clamp(1, 300);
+        if self.subagents.max_tokens_per_run <= 0 {
+            self.subagents.max_tokens_per_run = default_subagent_max_tokens_per_run();
+        }
+        self.subagents.max_tokens_per_run =
+            self.subagents.max_tokens_per_run.clamp(2_000, 2_000_000);
+        if self.subagents.orchestrate_max_workers == 0 {
+            self.subagents.orchestrate_max_workers = default_subagent_orchestrate_max_workers();
+        }
+        self.subagents.orchestrate_max_workers =
+            self.subagents.orchestrate_max_workers.clamp(1, 12);
         self.tool_timeout_overrides = self
             .tool_timeout_overrides
             .drain()

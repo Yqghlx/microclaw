@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use tokio::sync::Semaphore;
@@ -23,12 +23,91 @@ const MAX_SUB_AGENT_ITERATIONS: usize = 16;
 #[derive(Debug, Clone, Copy)]
 struct SubagentRuntimeMeta {
     depth: i64,
+    token_budget_remaining: Option<i64>,
 }
 
 fn subagent_runtime_meta_from_input(input: &serde_json::Value) -> Option<SubagentRuntimeMeta> {
     let meta = input.get("__subagent_runtime")?;
     let depth = meta.get("depth").and_then(|v| v.as_i64()).unwrap_or(0);
-    Some(SubagentRuntimeMeta { depth })
+    let token_budget_remaining = meta
+        .get("token_budget_remaining")
+        .and_then(|v| v.as_i64())
+        .filter(|v| *v > 0);
+    Some(SubagentRuntimeMeta {
+        depth,
+        token_budget_remaining,
+    })
+}
+
+fn normalize_subagent_artifact_payload(raw_text: &str) -> (String, String) {
+    let text = raw_text.trim();
+    let parsed = serde_json::from_str::<serde_json::Value>(text).ok();
+    let mut summary = String::new();
+    let mut final_answer = String::new();
+    let mut findings: Vec<String> = Vec::new();
+    let mut next_actions: Vec<String> = Vec::new();
+    let mut artifacts: Vec<serde_json::Value> = Vec::new();
+    if let Some(obj) = parsed.as_ref().and_then(|v| v.as_object()) {
+        summary = obj
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        final_answer = obj
+            .get("final_answer")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if let Some(arr) = obj.get("findings").and_then(|v| v.as_array()) {
+            findings = arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+        }
+        if let Some(arr) = obj.get("next_actions").and_then(|v| v.as_array()) {
+            next_actions = arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+        }
+        if let Some(arr) = obj.get("artifacts").and_then(|v| v.as_array()) {
+            artifacts = arr.clone();
+        }
+    }
+    if summary.is_empty() {
+        summary = text
+            .chars()
+            .take(600)
+            .collect::<String>()
+            .trim()
+            .to_string();
+    }
+    if final_answer.is_empty() {
+        final_answer = summary.clone();
+    }
+    let envelope = json!({
+        "protocol": "subagent_artifact_v1",
+        "summary": summary,
+        "findings": findings,
+        "artifacts": artifacts,
+        "next_actions": next_actions,
+        "final_answer": final_answer,
+        "raw_text": text,
+    });
+    let answer_text = envelope
+        .get("final_answer")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(sub-agent produced no output)")
+        .to_string();
+    (answer_text, envelope.to_string())
 }
 
 struct SubagentRuntime {
@@ -118,10 +197,11 @@ async fn run_sub_agent_task(
     auth_context: ToolAuthContext,
     run_id: String,
     depth: i64,
+    run_token_budget: i64,
     task: String,
     context: String,
     local_cancel: Arc<AtomicBool>,
-) -> Result<(String, i64, i64), String> {
+) -> Result<(String, String, i64, i64), String> {
     let llm = crate::llm::create_provider(&config);
     let allow_session_tools = depth < config.subagents.max_spawn_depth as i64;
     let tools = ToolRegistry::new_sub_agent(
@@ -132,7 +212,7 @@ async fn run_sub_agent_task(
     );
     let tool_defs = tools.definitions().to_vec();
 
-    let system_prompt = "You are a sub-agent assistant. Complete the given task thoroughly and return a clear, concise result. You have access to tools for file operations, search, and web access. Focus on the task and provide actionable output.".to_string();
+    let system_prompt = "You are a sub-agent assistant. Complete the task thoroughly with tool use when needed.\nOutput contract (required): return a JSON object with keys:\n- summary: string\n- findings: string[]\n- artifacts: {type,path,description}[]\n- next_actions: string[]\n- final_answer: string\nReturn only JSON in the final turn.".to_string();
 
     let user_content = if context.is_empty() {
         task.to_string()
@@ -180,6 +260,13 @@ async fn run_sub_agent_task(
                 .map(|_| ())
             })
             .await;
+            let total = input_tokens_sum + output_tokens_sum;
+            if run_token_budget > 0 && total > run_token_budget {
+                return Err(format!(
+                    "budget_exceeded: total_tokens={} budget={}",
+                    total, run_token_budget
+                ));
+            }
         }
 
         let stop_reason = response.stop_reason.as_deref().unwrap_or("end_turn");
@@ -193,12 +280,18 @@ async fn run_sub_agent_task(
                 })
                 .collect::<Vec<_>>()
                 .join("");
-            let final_text = if text.is_empty() {
+            let source = if text.is_empty() {
                 "(sub-agent produced no output)".to_string()
             } else {
                 text
             };
-            return Ok((final_text, input_tokens_sum, output_tokens_sum));
+            let (final_text, artifact_json) = normalize_subagent_artifact_payload(&source);
+            return Ok((
+                final_text,
+                artifact_json,
+                input_tokens_sum,
+                output_tokens_sum,
+            ));
         }
 
         if stop_reason == "tool_use" {
@@ -244,11 +337,17 @@ async fn run_sub_agent_task(
                     .await;
                     let mut tool_input = input.clone();
                     if let Some(obj) = tool_input.as_object_mut() {
+                        let remaining_budget = if run_token_budget > 0 {
+                            Some((run_token_budget - input_tokens_sum - output_tokens_sum).max(0))
+                        } else {
+                            None
+                        };
                         obj.insert(
                             "__subagent_runtime".to_string(),
                             json!({
                                 "run_id": run_id.clone(),
                                 "depth": depth,
+                                "token_budget_remaining": remaining_budget,
                             }),
                         );
                     }
@@ -279,12 +378,18 @@ async fn run_sub_agent_task(
             })
             .collect::<Vec<_>>()
             .join("");
-        let final_text = if text.is_empty() {
+        let source = if text.is_empty() {
             "(sub-agent produced no output)".to_string()
         } else {
             text
         };
-        return Ok((final_text, input_tokens_sum, output_tokens_sum));
+        let (final_text, artifact_json) = normalize_subagent_artifact_payload(&source);
+        return Ok((
+            final_text,
+            artifact_json,
+            input_tokens_sum,
+            output_tokens_sum,
+        ));
     }
 
     Err("Sub-agent reached maximum iterations without completing the task.".into())
@@ -314,8 +419,8 @@ async fn build_announce_payload(
     };
 
     let mut text = format!(
-        "{status_emoji} Subagent `{}` finished\nstatus: {}\ninput_tokens: {}\noutput_tokens: {}",
-        run.run_id, run.status, run.input_tokens, run.output_tokens
+        "{status_emoji} Subagent `{}` finished\nstatus: {}\ninput_tokens: {}\noutput_tokens: {}\nbudget: {}",
+        run.run_id, run.status, run.input_tokens, run.output_tokens, run.token_budget
     );
     if let Some(err) = &run.error_text {
         text.push_str(&format!("\nerror: {err}"));
@@ -431,6 +536,10 @@ impl Tool for SessionsSpawnTool {
                     "chat_id": {
                         "type": "integer",
                         "description": "Target chat id. Defaults to current chat."
+                    },
+                    "token_budget": {
+                        "type": "integer",
+                        "description": "Optional token budget cap for this run."
                     }
                 }),
                 &["task"],
@@ -468,6 +577,7 @@ impl Tool for SessionsSpawnTool {
             .to_string();
         let parent_meta = subagent_runtime_meta_from_input(&input);
         let parent_depth = parent_meta.map(|m| m.depth).unwrap_or(0);
+        let parent_budget_remaining = parent_meta.and_then(|m| m.token_budget_remaining);
         let child_depth = if parent_depth > 0 {
             parent_depth + 1
         } else {
@@ -484,6 +594,14 @@ impl Tool for SessionsSpawnTool {
             .and_then(|v| v.get("run_id"))
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        let requested_budget = input
+            .get("token_budget")
+            .and_then(|v| v.as_i64())
+            .filter(|v| *v > 0);
+        let child_token_budget = requested_budget
+            .or_else(|| parent_budget_remaining.map(|v| (v / 2).max(2_000)))
+            .unwrap_or(self.config.subagents.max_tokens_per_run)
+            .clamp(2_000, self.config.subagents.max_tokens_per_run);
 
         let db_for_count = self.db.clone();
         let active_count = match call_blocking(db_for_count, move |db| {
@@ -538,6 +656,7 @@ impl Tool for SessionsSpawnTool {
                 &run_id_for_insert,
                 parent_for_insert.as_deref(),
                 child_depth,
+                child_token_budget,
                 chat_id,
                 &caller_channel_for_insert,
                 &task_for_insert,
@@ -591,6 +710,7 @@ impl Tool for SessionsSpawnTool {
                             "failed",
                             Some("subagent runtime is shutting down"),
                             None,
+                            None,
                             0,
                             0,
                         )
@@ -616,6 +736,7 @@ impl Tool for SessionsSpawnTool {
                 auth_async,
                 run_id_async.clone(),
                 child_depth,
+                child_token_budget,
                 task_async,
                 context_async,
                 local_cancel,
@@ -633,7 +754,7 @@ impl Tool for SessionsSpawnTool {
             };
 
             match final_outcome {
-                Ok((result, input_tokens, output_tokens)) => {
+                Ok((result, artifact_json, input_tokens, output_tokens)) => {
                     let rid = run_id_for_finish.clone();
                     let _ = call_blocking(db.clone(), move |db| {
                         db.mark_subagent_finished(
@@ -641,6 +762,7 @@ impl Tool for SessionsSpawnTool {
                             "completed",
                             None,
                             Some(&result),
+                            Some(&artifact_json),
                             input_tokens,
                             output_tokens,
                         )
@@ -655,6 +777,7 @@ impl Tool for SessionsSpawnTool {
                             &rid,
                             "cancelled",
                             Some("Cancelled by user"),
+                            None,
                             None,
                             0,
                             0,
@@ -671,6 +794,7 @@ impl Tool for SessionsSpawnTool {
                             "timed_out",
                             Some("Sub-agent run exceeded configured timeout"),
                             None,
+                            None,
                             0,
                             0,
                         )
@@ -681,8 +805,13 @@ impl Tool for SessionsSpawnTool {
                 Err(err) => {
                     let rid = run_id_for_finish.clone();
                     let err_for_db = err.clone();
+                    let status = if err_for_db.contains("budget_exceeded:") {
+                        "budget_exceeded"
+                    } else {
+                        "failed"
+                    };
                     let _ = call_blocking(db.clone(), move |db| {
-                        db.mark_subagent_finished(&rid, "failed", Some(&err_for_db), None, 0, 0)
+                        db.mark_subagent_finished(&rid, status, Some(&err_for_db), None, None, 0, 0)
                     })
                     .await;
                     log_subagent_event(db.clone(), &run_id_for_finish, "failed", Some(err)).await;
@@ -716,6 +845,7 @@ impl Tool for SessionsSpawnTool {
                 "run_id": run_id,
                 "chat_id": chat_id,
                 "depth": child_depth,
+                "token_budget": child_token_budget,
                 "parent_run_id": parent_run_id,
             })
             .to_string(),
@@ -790,6 +920,7 @@ impl Tool for SubagentsListTool {
                     "run_id": r.run_id,
                     "parent_run_id": r.parent_run_id,
                     "depth": r.depth,
+                    "token_budget": r.token_budget,
                     "status": r.status,
                     "created_at": r.created_at,
                     "started_at": r.started_at,
@@ -798,6 +929,7 @@ impl Tool for SubagentsListTool {
                     "task": r.task,
                     "input_tokens": r.input_tokens,
                     "output_tokens": r.output_tokens,
+                    "artifact_json": r.artifact_json,
                 })
             })
             .collect();
@@ -888,6 +1020,8 @@ impl Tool for SubagentsInfoTool {
                 "total_tokens": run.total_tokens,
                 "provider": run.provider,
                 "model": run.model,
+                "token_budget": run.token_budget,
+                "artifact_json": run.artifact_json,
             })
             .to_string(),
         )
@@ -1281,6 +1415,7 @@ impl Tool for SubagentsSendTool {
             "__subagent_runtime": {
                 "run_id": parent.run_id,
                 "depth": parent.depth,
+                "token_budget_remaining": parent.token_budget,
             }
         });
         spawn_tool.execute(spawn_input).await
@@ -1289,6 +1424,242 @@ impl Tool for SubagentsSendTool {
 
 pub struct SubagentsLogTool {
     db: Arc<Database>,
+}
+
+pub struct SubagentsOrchestrateTool {
+    config: Config,
+    db: Arc<Database>,
+    channel_registry: Arc<ChannelRegistry>,
+}
+
+impl SubagentsOrchestrateTool {
+    pub fn new(config: &Config, db: Arc<Database>, channel_registry: Arc<ChannelRegistry>) -> Self {
+        Self {
+            config: config.clone(),
+            db,
+            channel_registry,
+        }
+    }
+
+    fn merge_run_artifacts(runs: &[microclaw_storage::db::SubagentRunRecord]) -> serde_json::Value {
+        let mut summaries = Vec::new();
+        let mut findings = BTreeSet::new();
+        let mut next_actions = BTreeSet::new();
+        let mut artifacts = Vec::new();
+        for run in runs {
+            let Some(raw) = run.artifact_json.as_deref() else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+                continue;
+            };
+            if let Some(s) = v.get("summary").and_then(|x| x.as_str()) {
+                if !s.trim().is_empty() {
+                    summaries.push(s.trim().to_string());
+                }
+            }
+            if let Some(arr) = v.get("findings").and_then(|x| x.as_array()) {
+                for f in arr.iter().filter_map(|x| x.as_str()) {
+                    if !f.trim().is_empty() {
+                        findings.insert(f.trim().to_string());
+                    }
+                }
+            }
+            if let Some(arr) = v.get("next_actions").and_then(|x| x.as_array()) {
+                for n in arr.iter().filter_map(|x| x.as_str()) {
+                    if !n.trim().is_empty() {
+                        next_actions.insert(n.trim().to_string());
+                    }
+                }
+            }
+            if let Some(arr) = v.get("artifacts").and_then(|x| x.as_array()) {
+                artifacts.extend(arr.iter().cloned());
+            }
+        }
+        json!({
+            "protocol": "orchestrate_merge_v1",
+            "summary": summaries,
+            "findings": findings.into_iter().collect::<Vec<_>>(),
+            "next_actions": next_actions.into_iter().collect::<Vec<_>>(),
+            "artifacts": artifacts,
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for SubagentsOrchestrateTool {
+    fn name(&self) -> &str {
+        "subagents_orchestrate"
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "subagents_orchestrate".into(),
+            description: "Depth=2 orchestration template: spawn multiple worker runs and optionally wait+merge structured artifacts.".into(),
+            input_schema: schema_object(
+                json!({
+                    "goal": {"type":"string"},
+                    "work_packages": {"type":"array", "items":{"type":"string"}},
+                    "chat_id": {"type":"integer"},
+                    "wait": {"type":"boolean"},
+                    "wait_timeout_secs": {"type":"integer", "minimum":1, "maximum":1200},
+                    "token_budget_total": {"type":"integer", "minimum":2000}
+                }),
+                &["goal", "work_packages"],
+            ),
+        }
+    }
+
+    async fn execute(&self, input: serde_json::Value) -> ToolResult {
+        let auth = match auth_context_from_input(&input) {
+            Some(v) => v,
+            None => {
+                return ToolResult::error(
+                    "subagents_orchestrate requires caller auth context".into(),
+                )
+            }
+        };
+        let chat_id = input
+            .get("chat_id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(auth.caller_chat_id);
+        if let Err(e) = authorize_chat_access(&input, chat_id) {
+            return ToolResult::error(e);
+        }
+        let goal = match input.get("goal").and_then(|v| v.as_str()) {
+            Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+            _ => return ToolResult::error("Missing required parameter: goal".into()),
+        };
+        let mut packages = input
+            .get("work_packages")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+        if packages.is_empty() {
+            return ToolResult::error("work_packages must include at least one item".into());
+        }
+        let max_workers = self
+            .config
+            .subagents
+            .orchestrate_max_workers
+            .min(self.config.subagents.max_children_per_run);
+        if packages.len() > max_workers {
+            packages.truncate(max_workers);
+        }
+        let wait = input.get("wait").and_then(|v| v.as_bool()).unwrap_or(false);
+        let wait_timeout_secs = input
+            .get("wait_timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(120)
+            .clamp(1, 1200);
+        let total_budget = input
+            .get("token_budget_total")
+            .and_then(|v| v.as_i64())
+            .filter(|v| *v > 0)
+            .unwrap_or(self.config.subagents.max_tokens_per_run);
+        let each_budget = (total_budget / packages.len() as i64).max(2_000);
+
+        let spawn_tool =
+            SessionsSpawnTool::new(&self.config, self.db.clone(), self.channel_registry.clone());
+        let mut spawned = Vec::new();
+        for (idx, pkg) in packages.iter().enumerate() {
+            let spawn_input = json!({
+                "task": format!("Work package {}: {}", idx + 1, pkg),
+                "context": format!(
+                    "Orchestration goal: {goal}\nOutput strictly in protocol subagent_artifact_v1 with keys summary/findings/artifacts/next_actions/final_answer."
+                ),
+                "chat_id": chat_id,
+                "token_budget": each_budget,
+                "__microclaw_auth": {
+                    "caller_channel": auth.caller_channel,
+                    "caller_chat_id": chat_id,
+                    "control_chat_ids": auth.control_chat_ids,
+                    "env_files": auth.env_files,
+                }
+            });
+            let res = spawn_tool.execute(spawn_input).await;
+            if res.is_error {
+                return res;
+            }
+            let parsed = match serde_json::from_str::<serde_json::Value>(&res.content) {
+                Ok(v) => v,
+                Err(e) => return ToolResult::error(format!("Invalid sessions_spawn output: {e}")),
+            };
+            let run_id = match parsed.get("run_id").and_then(|v| v.as_str()) {
+                Some(v) => v.to_string(),
+                None => return ToolResult::error("sessions_spawn did not return run_id".into()),
+            };
+            spawned.push(run_id);
+        }
+
+        if !wait {
+            return ToolResult::success(
+                json!({
+                    "status": "accepted",
+                    "chat_id": chat_id,
+                    "goal": goal,
+                    "workers": spawned.len(),
+                    "run_ids": spawned,
+                    "token_budget_total": total_budget,
+                    "token_budget_each": each_budget,
+                })
+                .to_string(),
+            );
+        }
+
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(wait_timeout_secs);
+        let mut runs = Vec::new();
+        while std::time::Instant::now() < deadline {
+            let ids = spawned.clone();
+            let rows = match call_blocking(self.db.clone(), move |db| {
+                let mut out = Vec::new();
+                for run_id in ids {
+                    if let Some(row) = db.get_subagent_run(&run_id, chat_id)? {
+                        out.push(row);
+                    }
+                }
+                Ok::<_, microclaw_core::error::MicroClawError>(out)
+            })
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => return ToolResult::error(format!("Failed loading runs: {e}")),
+            };
+            let done = rows
+                .iter()
+                .all(|r| !matches!(r.status.as_str(), "accepted" | "queued" | "running"));
+            runs = rows;
+            if done {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        let merged = Self::merge_run_artifacts(&runs);
+        ToolResult::success(
+            json!({
+                "status": "merged",
+                "chat_id": chat_id,
+                "goal": goal,
+                "workers": spawned.len(),
+                "run_ids": spawned,
+                "runs": runs.into_iter().map(|r| json!({
+                    "run_id": r.run_id,
+                    "status": r.status,
+                    "depth": r.depth,
+                    "token_budget": r.token_budget,
+                    "total_tokens": r.total_tokens,
+                    "artifact_json": r.artifact_json,
+                })).collect::<Vec<_>>(),
+                "merged": merged,
+            })
+            .to_string(),
+        )
+    }
 }
 
 impl SubagentsLogTool {
