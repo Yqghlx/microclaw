@@ -328,12 +328,12 @@ async fn build_announce_payload(
     Ok(text)
 }
 
-async fn flush_pending_announces(
+pub async fn flush_pending_announces_once(
     config: &Config,
     channel_registry: Arc<ChannelRegistry>,
     db: Arc<Database>,
     max_batch: usize,
-) {
+) -> usize {
     let now = chrono::Utc::now().to_rfc3339();
     let rows = match call_blocking(db.clone(), move |db| {
         db.list_due_subagent_announces(&now, max_batch)
@@ -343,10 +343,11 @@ async fn flush_pending_announces(
         Ok(v) => v,
         Err(e) => {
             warn!("failed to list due subagent announces: {e}");
-            return;
+            return 0;
         }
     };
 
+    let mut processed = 0usize;
     for row in rows {
         let bot_username = config.bot_username_for_channel(&row.caller_channel);
         let delivery = deliver_and_store_bot_message(
@@ -386,7 +387,9 @@ async fn flush_pending_announces(
                 .await;
             }
         }
+        processed += 1;
     }
+    processed
 }
 
 pub struct SessionsSpawnTool {
@@ -697,7 +700,7 @@ impl Tool for SessionsSpawnTool {
                             db.enqueue_subagent_announce(&rid, chat_id, &caller_channel, &payload)
                         })
                         .await;
-                        flush_pending_announces(&cfg, channel_registry, db, 10).await;
+                        let _ = flush_pending_announces_once(&cfg, channel_registry, db, 10).await;
                     }
                     Err(e) => {
                         warn!("failed to build announce payload for run {run_id_async}: {e}");
@@ -1423,7 +1426,7 @@ impl Tool for SubagentsRetryAnnouncesTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(50)
             .clamp(1, 200) as usize;
-        flush_pending_announces(
+        let _ = flush_pending_announces_once(
             &self.config,
             self.channel_registry.clone(),
             self.db.clone(),
